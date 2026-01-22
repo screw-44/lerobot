@@ -736,6 +736,28 @@ class LeRobotDataset(torch.utils.data.Dataset):
             check_delta_timestamps(self.delta_timestamps, self.fps, self.tolerance_s)
             self.delta_indices = get_delta_indices(self.delta_timestamps, self.fps)
 
+        # Initialize valid_indices to None
+        self.valid_indices = None
+
+        if self.hf_dataset is not None and "predict_status" in self.hf_dataset.features:
+            status_list = self.hf_dataset["predict_status"]
+            
+            # Helper to extract value
+            def get_status_val(s):
+                if hasattr(s, "item"):
+                    return s.item()
+                if isinstance(s, (list, tuple, np.ndarray)) and len(s) > 0:
+                    return s[0]
+                return s
+
+            # Assume 2 is the status to filter out (intermediate points)
+            self.valid_indices = [
+                i for i, status in enumerate(status_list) 
+                if get_status_val(status) != 2
+            ]
+            
+            print(f"Filtered dataset from {len(self.hf_dataset)} to {len(self.valid_indices)} frames based on predict_status.")
+
     def _close_writer(self) -> None:
         """Close and cleanup the parquet writer if it exists."""
         writer = getattr(self, "writer", None)
@@ -925,16 +947,44 @@ class LeRobotDataset(torch.utils.data.Dataset):
         else:
             return get_hf_features_from_features(self.features)
 
-    def _get_query_indices(self, idx: int, ep_idx: int) -> tuple[dict[str, list[int | bool]]]:
+    def _get_query_indices(self, idx: int, ep_idx: int, sparse_idx: int | None = None) -> tuple[dict[str, list[int | bool]]]:
         ep = self.meta.episodes[ep_idx]
         ep_start = ep["dataset_from_index"]
         ep_end = ep["dataset_to_index"]
         query_indices = {}
         padding = {}
 
+        # NOTE
+
         for key, delta_idx in self.delta_indices.items():
+            # Special handling regarding actions step when using sparse indices
+            if key == "action" and sparse_idx is not None and self.valid_indices is not None:
+                q_indices = []
+                is_pad = []
+                for delta in delta_idx:
+                    target_sparse_idx = sparse_idx + delta
+                    
+                    if target_sparse_idx < 0 or target_sparse_idx >= len(self.valid_indices):
+                        real_idx_clamped = min(ep_end - 1, max(ep_start, idx))
+                        q_indices.append(real_idx_clamped)
+                        is_pad.append(True)
+                        continue
+
+                    real_idx = self.valid_indices[target_sparse_idx]
+
+                    if real_idx < ep_start or real_idx >= ep_end:
+                        real_idx_clamped = min(ep_end - 1, max(ep_start, idx))
+                        q_indices.append(real_idx_clamped)
+                        is_pad.append(True)
+                    else:
+                        q_indices.append(real_idx)
+                        is_pad.append(False)
+                
+                query_indices[key] = q_indices
+                padding[f"{key}_is_pad"] = torch.BoolTensor(is_pad)
+
             # Special handling for "affordance" key: return all frames from current to episode end
-            if key == "aff":
+            elif key == "aff":
                 # Generate indices from idx to ep_end (exclusive), clamped to valid range
                 affordance_indices = list(range(max(idx, ep_start), ep_end))
                 # If range is empty, return at least the current frame
@@ -999,6 +1049,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             )
             # Special handling for "affordance/abs_affordance": query from "action" column
             query_key = "action" 
+            # NOTE:
             result[key] = torch.stack(self.hf_dataset[query_key][relative_indices])
         return result
 
@@ -1034,9 +1085,16 @@ class LeRobotDataset(torch.utils.data.Dataset):
             self._lazy_loading = False
 
     def __len__(self):
+        if self.valid_indices is not None:
+            return len(self.valid_indices)
         return self.num_frames
 
     def __getitem__(self, idx) -> dict:
+        sparse_idx = None
+        if self.valid_indices is not None:
+            sparse_idx = idx
+            idx = self.valid_indices[idx]
+
         # Ensure dataset is loaded when we actually need to read from it
         self._ensure_hf_dataset_loaded()
         item = self.hf_dataset[idx]
@@ -1044,7 +1102,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         query_indices = None
         if self.delta_indices is not None:
-            query_indices, padding = self._get_query_indices(idx, ep_idx)
+            query_indices, padding = self._get_query_indices(idx, ep_idx, sparse_idx=sparse_idx)
             query_result = self._query_hf_dataset(query_indices)
             item = {**item, **padding}
             for key, val in query_result.items():
